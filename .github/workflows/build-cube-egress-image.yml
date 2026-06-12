@@ -1,0 +1,316 @@
+name: Build CubeEgress Images
+
+# Two-stage build for CubeEgress:
+#   1. openresty-tproxy base image (CubeEgress/openresty/Dockerfile)
+#   2. cube-egress application image (CubeEgress/Dockerfile, FROM the base)
+#
+# Pushes both stages to:
+#   - GHCR (always, when on master / tag / dispatch / workflow_call)
+#   - Tencent Cloud CR (only when TCR_USERNAME / TCR_PASSWORD secrets are set)
+#
+# CubeEgress/Dockerfile hard-codes
+#   FROM cube-egress/openresty:1.29.2.5-tproxy
+# so the stage-2 job retags the registry-pushed base image to that local tag
+# before building, instead of patching the Dockerfile.
+
+on:
+  push:
+    tags:
+      - '*'
+    branches: [master]
+    paths:
+      - 'CubeEgress/**'
+      - '.github/workflows/build-cube-egress-image.yml'
+  pull_request:
+    paths:
+      - 'CubeEgress/**'
+      - '.github/workflows/build-cube-egress-image.yml'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Override tag applied to the cube-egress image (e.g. release tag).'
+        required: false
+        type: string
+
+concurrency:
+  group: build-cube-egress-image-${{ github.ref }}-${{ inputs.release_tag || '' }}
+  cancel-in-progress: false
+
+env:
+  OPENRESTY_VERSION: '1.29.2.5'
+  NGINX_VERSION: '1.29.2'
+  # Must match `FROM cube-egress/openresty:<TAG>` in CubeEgress/Dockerfile.
+  OPENRESTY_BASE_TAG: '1.29.2.5-tproxy'
+  GHCR_BASE_IMAGE: ghcr.io/tencentcloud/cubesandbox-openresty-tproxy
+  GHCR_APP_IMAGE: ghcr.io/tencentcloud/cube-egress
+  TCR_REGISTRY: cube-sandbox-cn.tencentcloudcr.com
+  TCR_BASE_IMAGE: cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/openresty-tproxy
+  TCR_APP_IMAGE: cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/cube-egress
+  # Local tar artifact name used to ferry the base image from job 1 to job 2
+  # in PR mode (when nothing has been pushed to a registry).
+  BASE_ARTIFACT_NAME: cube-egress-openresty-base-image
+
+jobs:
+  build_openresty_base:
+    name: Build openresty-tproxy base image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      base_strategy: ${{ steps.strategy.outputs.base_strategy }}
+      tcr_enabled: ${{ steps.tcr_check.outputs.tcr_enabled }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Decide base-image handoff strategy
+        id: strategy
+        run: |
+          # On PRs we cannot push to the registry, so the application stage
+          # downloads the base from a tar artifact. Otherwise it pulls from
+          # GHCR (the canonical source for CubeEgress base images).
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "base_strategy=artifact" >> "${GITHUB_OUTPUT}"
+            echo "push_enabled=false"     >> "${GITHUB_OUTPUT}"
+          else
+            echo "base_strategy=registry" >> "${GITHUB_OUTPUT}"
+            echo "push_enabled=true"      >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Detect Tencent Cloud CR credentials
+        id: tcr_check
+        env:
+          TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
+          TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
+        run: |
+          # Secrets aren't usable in step `if:` expressions directly, so we
+          # bridge them through env: and emit a job-level output that later
+          # steps and the downstream job can gate on.
+          if [[ -n "${TCR_USERNAME}" && -n "${TCR_PASSWORD}" \
+                && "${{ steps.strategy.outputs.push_enabled }}" == "true" ]]; then
+            echo "tcr_enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tcr_enabled=false" >> "${GITHUB_OUTPUT}"
+            if [[ "${{ steps.strategy.outputs.push_enabled }}" == "true" ]]; then
+              echo "::warning::TCR_USERNAME / TCR_PASSWORD not set; skipping Tencent CR push."
+            fi
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: steps.strategy.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Tencent Cloud CR
+        if: steps.tcr_check.outputs.tcr_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TCR_REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Extract image metadata (GHCR)
+        id: meta_ghcr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_BASE_IMAGE }}
+          tags: |
+            type=raw,value=${{ env.OPENRESTY_BASE_TAG }}
+            type=raw,value=${{ env.OPENRESTY_VERSION }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Extract image metadata (Tencent CR)
+        id: meta_tcr
+        if: steps.tcr_check.outputs.tcr_enabled == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.TCR_BASE_IMAGE }}
+          tags: |
+            type=raw,value=${{ env.OPENRESTY_BASE_TAG }}
+            type=raw,value=${{ env.OPENRESTY_VERSION }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Compose tag list
+        id: tags
+        run: |
+          {
+            echo 'tags<<__EOF__'
+            printf '%s\n' '${{ steps.meta_ghcr.outputs.tags }}'
+            if [[ "${{ steps.tcr_check.outputs.tcr_enabled }}" == "true" ]]; then
+              printf '%s\n' '${{ steps.meta_tcr.outputs.tags }}'
+            fi
+            # Always include the canonical local tag so PR-mode `docker load`
+            # in the next job finds `cube-egress/openresty:<tag>`.
+            echo "cube-egress/openresty:${OPENRESTY_BASE_TAG}"
+            echo '__EOF__'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push openresty-tproxy
+        id: build_base
+        uses: docker/build-push-action@v6
+        with:
+          context: CubeEgress/openresty
+          file: CubeEgress/openresty/Dockerfile
+          platforms: linux/amd64
+          push: ${{ steps.strategy.outputs.push_enabled == 'true' }}
+          load: ${{ steps.strategy.outputs.push_enabled != 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.meta_ghcr.outputs.labels }}
+          build-args: |
+            OPENRESTY_VERSION=${{ env.OPENRESTY_VERSION }}
+            NGINX_VERSION=${{ env.NGINX_VERSION }}
+          cache-from: type=gha,scope=cube-egress-openresty
+          cache-to: type=gha,scope=cube-egress-openresty,mode=max
+
+      - name: Save base image as tar (PR mode)
+        if: steps.strategy.outputs.base_strategy == 'artifact'
+        run: |
+          mkdir -p base-image-artifact
+          docker save \
+            "cube-egress/openresty:${OPENRESTY_BASE_TAG}" \
+            -o base-image-artifact/openresty-base.tar
+
+      - name: Upload base image artifact (PR mode)
+        if: steps.strategy.outputs.base_strategy == 'artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BASE_ARTIFACT_NAME }}
+          path: base-image-artifact/openresty-base.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  build_cube_egress:
+    name: Build cube-egress application image
+    runs-on: ubuntu-latest
+    needs: build_openresty_base
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Decide push policy
+        id: strategy
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "push_enabled=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "push_enabled=true"  >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        if: steps.strategy.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Tencent Cloud CR
+        if: needs.build_openresty_base.outputs.tcr_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TCR_REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Materialize base image (registry mode)
+        if: needs.build_openresty_base.outputs.base_strategy == 'registry'
+        run: |
+          # Stage 2's Dockerfile uses
+          #   FROM cube-egress/openresty:1.29.2.5-tproxy
+          # so we pull the registry copy and retag it locally.
+          src="${GHCR_BASE_IMAGE}:${OPENRESTY_BASE_TAG}"
+          dst="cube-egress/openresty:${OPENRESTY_BASE_TAG}"
+          docker pull "${src}"
+          docker tag "${src}" "${dst}"
+
+      - name: Download base image artifact (PR mode)
+        if: needs.build_openresty_base.outputs.base_strategy == 'artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BASE_ARTIFACT_NAME }}
+          path: base-image-artifact
+
+      - name: Load base image (PR mode)
+        if: needs.build_openresty_base.outputs.base_strategy == 'artifact'
+        run: |
+          docker load -i base-image-artifact/openresty-base.tar
+          docker image inspect "cube-egress/openresty:${OPENRESTY_BASE_TAG}" >/dev/null
+
+      - name: Resolve cube-egress tag
+        id: app_tag
+        run: |
+          # workflow_call passes release_tag explicitly. For tag pushes we
+          # mirror github.ref_name. For master path pushes we tag `latest`
+          # plus a sha-based tag (handled by metadata-action below).
+          release_tag='${{ inputs.release_tag }}'
+          if [[ -z "${release_tag}" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          if [[ -n "${release_tag}" ]]; then
+            echo "is_release=true"  >> "${GITHUB_OUTPUT}"
+          else
+            echo "is_release=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Extract image metadata (GHCR)
+        id: meta_ghcr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_APP_IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.app_tag.outputs.release_tag }},enable=${{ steps.app_tag.outputs.is_release == 'true' }}
+            type=raw,value=latest,enable=${{ steps.app_tag.outputs.is_release == 'true' || github.ref == 'refs/heads/master' }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Extract image metadata (Tencent CR)
+        id: meta_tcr
+        if: needs.build_openresty_base.outputs.tcr_enabled == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.TCR_APP_IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.app_tag.outputs.release_tag }},enable=${{ steps.app_tag.outputs.is_release == 'true' }}
+            type=raw,value=latest,enable=${{ steps.app_tag.outputs.is_release == 'true' || github.ref == 'refs/heads/master' }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Compose tag list
+        id: tags
+        run: |
+          {
+            echo 'tags<<__EOF__'
+            printf '%s\n' '${{ steps.meta_ghcr.outputs.tags }}'
+            if [[ "${{ needs.build_openresty_base.outputs.tcr_enabled }}" == "true" ]]; then
+              printf '%s\n' '${{ steps.meta_tcr.outputs.tags }}'
+            fi
+            echo '__EOF__'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push cube-egress
+        uses: docker/build-push-action@v6
+        with:
+          context: CubeEgress
+          file: CubeEgress/Dockerfile
+          platforms: linux/amd64
+          push: ${{ steps.strategy.outputs.push_enabled == 'true' }}
+          load: ${{ steps.strategy.outputs.push_enabled != 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.meta_ghcr.outputs.labels }}
+          cache-from: type=gha,scope=cube-egress-app
+          cache-to: type=gha,scope=cube-egress-app,mode=max
