@@ -3019,7 +3019,10 @@ pub async fn get_agent_wecom_config(
 
     let config = match (record.wecom_bot_id.clone(), record.wecom_bot_secret.clone()) {
         (Some(bot_id), Some(bot_secret)) if !bot_id.is_empty() && !bot_secret.is_empty() => {
-            Some(AgentWeComConfig { bot_id, bot_secret })
+            Some(AgentWeComConfig {
+                bot_id,
+                bot_secret: crate::crypto::decrypt_or_passthrough(&bot_secret),
+            })
         }
         _ => read_openclaw_wecom_config(&state, &record.sandbox_id, &record.domain)
             .await

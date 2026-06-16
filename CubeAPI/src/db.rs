@@ -1478,7 +1478,10 @@ impl AgentHubInstanceRecord {
             openclaw_persist_id: self.openclaw_persist_id,
             openclaw_state_path: self.openclaw_state_path,
             wecom_config: match (self.wecom_bot_id, self.wecom_bot_secret) {
-                (Some(bot_id), Some(bot_secret)) => Some(AgentWeComConfig { bot_id, bot_secret }),
+                (Some(bot_id), Some(bot_secret)) => Some(AgentWeComConfig {
+                    bot_id,
+                    bot_secret: crate::crypto::decrypt_or_passthrough(&bot_secret),
+                }),
                 _ => None,
             },
             setup: self.setup_exit_code.map(|exit_code| AgentSetupResult {

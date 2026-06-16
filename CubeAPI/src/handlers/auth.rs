@@ -18,7 +18,8 @@ use crate::{
 };
 
 const SESSION_HEADER: &str = "x-session-token";
-const SESSION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+const SESSION_TTL_SECS: i64 = 24 * 60 * 60;
+const INVALID_CURRENT_PASSWORD: &str = "current password is incorrect or user not found";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +62,12 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn password_matches(stored: Option<&str>, candidate: &str) -> bool {
+    stored
+        .map(|expected| crate::crypto::verify_password(expected, candidate))
+        .unwrap_or(false)
+}
+
 pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
@@ -84,9 +91,8 @@ pub async fn login(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to read user: {}", e)))?;
 
-    match stored {
-        Some(expected) if crate::crypto::verify_password(&expected, &password) => {}
-        _ => return Err(AppError::Unauthorized("invalid credentials".to_string())),
+    if !password_matches(stored.as_deref(), &password) {
+        return Err(AppError::Unauthorized("invalid credentials".to_string()));
     }
 
     let token = uuid::Uuid::new_v4().simple().to_string();
@@ -177,14 +183,8 @@ pub async fn change_password(
         .get_user_password(username)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to read user: {}", e)))?;
-    match stored {
-        Some(expected) if crate::crypto::verify_password(&expected, &body.old_password) => {}
-        Some(_) => {
-            return Err(AppError::Unauthorized(
-                "current password is incorrect".to_string(),
-            ))
-        }
-        None => return Err(AppError::NotFound(format!("user {} not found", username))),
+    if !password_matches(stored.as_deref(), &body.old_password) {
+        return Err(AppError::Unauthorized(INVALID_CURRENT_PASSWORD.to_string()));
     }
 
     let new_hash = crate::crypto::hash_password(&body.new_password)
@@ -195,4 +195,37 @@ pub async fn change_password(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to update password: {}", e)))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ttl_is_limited_to_one_day() {
+        assert_eq!(SESSION_TTL_SECS, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn password_matches_rejects_missing_user() {
+        assert!(!password_matches(None, "password"));
+    }
+
+    #[test]
+    fn password_matches_supports_hashed_and_legacy_passwords() {
+        let hash = crate::crypto::hash_password("secret").expect("hash should succeed");
+
+        assert!(password_matches(Some(&hash), "secret"));
+        assert!(!password_matches(Some(&hash), "wrong"));
+        assert!(password_matches(Some("legacy-secret"), "legacy-secret"));
+        assert!(!password_matches(Some("legacy-secret"), "wrong"));
+    }
+
+    #[test]
+    fn change_password_uses_non_enumerating_error_message() {
+        assert_eq!(
+            INVALID_CURRENT_PASSWORD,
+            "current password is incorrect or user not found"
+        );
+    }
 }

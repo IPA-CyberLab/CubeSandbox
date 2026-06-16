@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 import { authApi } from '@/api/client';
+import { getLastAuthStatus, setLastAuthStatus } from '@/lib/session';
 
 type GuardState = 'checking' | 'allowed' | 'guest';
 
@@ -23,12 +24,14 @@ export function AuthGuard() {
       .session()
       .then((res) => {
         if (cancelled) return;
-        setState(!res.authRequired || res.authenticated ? 'allowed' : 'guest');
+        const nextState = !res.authRequired || res.authenticated ? 'allowed' : 'guest';
+        setLastAuthStatus(nextState);
+        setState(nextState);
       })
       .catch(() => {
-        // If the session check itself fails (e.g. backend unreachable), fail
-        // open so the rest of the UI can surface its own errors.
-        if (!cancelled) setState('allowed');
+        // Keep previously verified sessions usable during transient backend
+        // errors, but do not grant access when there is no verified state.
+        if (!cancelled) setState(getLastAuthStatus() ?? 'guest');
       });
     return () => {
       cancelled = true;

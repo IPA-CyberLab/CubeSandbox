@@ -45,6 +45,19 @@ fn load_key() -> [u8; 32] {
     key
 }
 
+/// Emits a startup warning when the process is using the built-in development
+/// encryption key for reversible AgentHub secrets.
+pub fn warn_if_using_dev_key() {
+    let configured = std::env::var("AGENTHUB_SECRET_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if !configured {
+        tracing::warn!(
+            "AGENTHUB_SECRET_KEY not set; using INSECURE development key. DO NOT use in production."
+        );
+    }
+}
+
 /// Encrypts a UTF-8 secret, returning an `enc:v1:` tagged, base64 payload.
 pub fn encrypt_secret(plaintext: &str) -> anyhow::Result<String> {
     let key = load_key();
@@ -88,7 +101,10 @@ pub fn is_encrypted(stored: &str) -> bool {
 /// in the encrypted format (legacy plaintext rows) or cannot be decrypted.
 pub fn decrypt_or_passthrough(stored: &str) -> String {
     if is_encrypted(stored) {
-        decrypt_secret(stored).unwrap_or_else(|_| stored.to_string())
+        decrypt_secret(stored).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to decrypt AgentHub secret; using stored value");
+            stored.to_string()
+        })
     } else {
         stored.to_string()
     }
@@ -106,5 +122,54 @@ pub fn verify_password(stored: &str, candidate: &str) -> bool {
         bcrypt::verify(candidate, stored).unwrap_or(false)
     } else {
         stored == candidate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var("AGENTHUB_SECRET_KEY", "test-secret-key-32-bytes-long-value");
+
+        let encrypted = encrypt_secret("wecom-secret").expect("encrypt should succeed");
+
+        assert!(is_encrypted(&encrypted));
+        assert_ne!(encrypted, "wecom-secret");
+        assert_eq!(
+            decrypt_secret(&encrypted).expect("decrypt should succeed"),
+            "wecom-secret"
+        );
+    }
+
+    #[test]
+    fn decrypt_or_passthrough_handles_plaintext_and_bad_ciphertext() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var("AGENTHUB_SECRET_KEY", "test-secret-key-32-bytes-long-value");
+
+        assert_eq!(decrypt_or_passthrough("legacy-secret"), "legacy-secret");
+        assert_eq!(
+            decrypt_or_passthrough("enc:v1:not-base64"),
+            "enc:v1:not-base64"
+        );
+    }
+
+    #[test]
+    fn password_hash_verification_supports_bcrypt_and_legacy_plaintext() {
+        let hashed = hash_password("correct horse").expect("hash should succeed");
+
+        assert!(verify_password(&hashed, "correct horse"));
+        assert!(!verify_password(&hashed, "wrong horse"));
+        assert!(verify_password("legacy-password", "legacy-password"));
+        assert!(!verify_password("legacy-password", "wrong"));
     }
 }
