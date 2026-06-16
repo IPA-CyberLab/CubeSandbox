@@ -19,6 +19,7 @@ from ._policy import (
     _serialize_rule,
     _validate_allow_out_domains_require_deny_all,
 )
+from ._pty import Pty
 from ._stream import _parse_line
 from ._transport import build_client
 
@@ -58,6 +59,7 @@ class Sandbox:
         self._client: httpx.Client | None = None
         self._commands = Commands(self)
         self._files = Filesystem(self)
+        self._pty = Pty(self)
 
 
     @property
@@ -86,6 +88,10 @@ class Sandbox:
     @property
     def files(self) -> "Filesystem":
         return self._files
+
+    @property
+    def pty(self) -> "Pty":
+        return self._pty
 
 
     @classmethod
