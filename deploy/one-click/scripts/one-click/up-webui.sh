@@ -24,6 +24,8 @@ WEB_UI_IMAGE="${WEB_UI_IMAGE:-cube-sandbox-image.tencentcloudcr.com/opensource/o
 WEB_UI_CONTAINER_NAME="${WEB_UI_CONTAINER_NAME:-cube-webui}"
 WEB_UI_HOST_PORT="${WEB_UI_HOST_PORT:-12088}"
 WEB_UI_UPSTREAM="${WEB_UI_UPSTREAM:-http://host.docker.internal:3000}"
+# cube-proxy (host network, port 80) for same-origin /sandbox/ forwarding.
+SANDBOX_PROXY_UPSTREAM="${SANDBOX_PROXY_UPSTREAM:-http://host.docker.internal:80}"
 COMPOSE_DETACH="${ONE_CLICK_COMPOSE_DETACH:-1}"
 PREPARE_ONLY="${ONE_CLICK_PREPARE_ONLY:-0}"
 
@@ -69,6 +71,7 @@ wait_for_tcp_port() {
 
 WEB_UI_HOST_PORT_ESCAPED="$(escape_sed "${WEB_UI_HOST_PORT}")"
 WEB_UI_UPSTREAM_ESCAPED="$(escape_sed "${WEB_UI_UPSTREAM}")"
+SANDBOX_PROXY_UPSTREAM_ESCAPED="$(escape_sed "${SANDBOX_PROXY_UPSTREAM}")"
 WEB_UI_IMAGE_ESCAPED="$(escape_sed "${WEB_UI_IMAGE}")"
 WEB_UI_CONTAINER_NAME_ESCAPED="$(escape_sed "${WEB_UI_CONTAINER_NAME}")"
 WEB_UI_DIST_DIR_ESCAPED="$(escape_sed "${WEB_UI_DIST_DIR}")"
@@ -78,7 +81,8 @@ render_template_atomic \
   "${NGINX_TEMPLATE}" \
   "${NGINX_CONF}" \
   -e "s#__WEB_UI_HOST_PORT__#${WEB_UI_HOST_PORT_ESCAPED}#g" \
-  -e "s#__WEB_UI_UPSTREAM__#${WEB_UI_UPSTREAM_ESCAPED}#g"
+  -e "s#__WEB_UI_UPSTREAM__#${WEB_UI_UPSTREAM_ESCAPED}#g" \
+  -e "s#__SANDBOX_PROXY_UPSTREAM__#${SANDBOX_PROXY_UPSTREAM_ESCAPED}#g"
 
 render_template_atomic \
   "${COMPOSE_TEMPLATE}" \

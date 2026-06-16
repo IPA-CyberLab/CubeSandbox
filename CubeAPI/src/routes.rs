@@ -18,7 +18,7 @@ use tower_http::{
 };
 
 use crate::{
-    handlers::{agenthub, cluster, config, health, sandboxes, snapshots, store, templates},
+    handlers::{agenthub, auth, cluster, config, health, sandboxes, snapshots, store, templates},
     middleware::{auth::unified_auth, rate_limit::rate_limit},
     state::AppState,
 };
@@ -83,10 +83,21 @@ fn build_e2b_snapshot_long_router(state: &AppState, auth_configured: bool) -> Ro
 fn build_cubeapi_router(state: &AppState, auth_configured: bool) -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health))
+        .merge(build_auth_routes())
         .merge(build_sandbox_routes(state, auth_configured))
         .merge(build_template_routes(state, auth_configured))
         .merge(build_cluster_routes(state, auth_configured))
         .merge(build_agenthub_routes(state, auth_configured))
+}
+
+/// WebUI login routes. These are intentionally left unauthenticated (like
+/// `/health`) so the login/session flow itself is always reachable.
+fn build_auth_routes() -> Router<AppState> {
+    Router::new()
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/session", get(auth::session))
+        .route("/auth/change-password", post(auth::change_password))
 }
 
 /// Same long-budget routes mounted under the `/cubeapi/v1` prefix.
@@ -258,6 +269,10 @@ fn build_agenthub_routes(state: &AppState, auth_configured: bool) -> Router<AppS
         )
         .route("/agenthub/templates", get(agenthub::list_agent_templates))
         .route(
+            "/agenthub/templates/market",
+            post(agenthub::register_market_agent_template),
+        )
+        .route(
             "/agenthub/templates/:templateID",
             patch(agenthub::update_agent_template).delete(agenthub::delete_agent_template),
         )
@@ -296,6 +311,10 @@ fn build_agenthub_routes(state: &AppState, auth_configured: bool) -> Router<AppS
         .route(
             "/agenthub/instances/:agentID/wecom",
             get(agenthub::get_agent_wecom_config).put(agenthub::update_agent_wecom_config),
+        )
+        .route(
+            "/agenthub/settings",
+            get(agenthub::get_agent_settings).put(agenthub::update_agent_settings),
         );
 
     with_auth(routes, state, auth_configured)
