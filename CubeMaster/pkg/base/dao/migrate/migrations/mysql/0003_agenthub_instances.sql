@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS `t_agenthub_instance` (
   `gateway_port` int NOT NULL DEFAULT 18789,
   `env_port` int NOT NULL DEFAULT 8080,
   `gateway_token` varchar(255) DEFAULT NULL,
+  `persistence_mode` varchar(32) DEFAULT NULL,
   `wecom_bot_id` varchar(255) DEFAULT NULL,
   `wecom_bot_secret` varchar(255) DEFAULT NULL,
   `last_error` text DEFAULT NULL,
